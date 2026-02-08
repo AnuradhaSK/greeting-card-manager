@@ -51,7 +51,7 @@ jobs:
           mkdir -p reports
           linkchecker -F html ${{ matrix.site.url }} \
             --threads=100 \
-            --output=reports/raw-${{ matrix.site.name }}.html
+            -o=reports/raw-${{ matrix.site.name }}.html
 
       - name: Generate filtered HTML report (inline Python)
         run: |
