@@ -49,9 +49,9 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p reports
-          linkchecker -F html ${{ matrix.site.url }} \
-            --threads=100 \
-            -o=reports/raw-${{ matrix.site.name }}.html
+          linkchecker ${{ matrix.site.url }} \
+          --threads=100 \
+          -F html/reports/raw-${{ matrix.site.name }}.html
 
       - name: Generate filtered HTML report (inline Python)
         run: |
