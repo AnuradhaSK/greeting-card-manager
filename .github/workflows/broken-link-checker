@@ -1,0 +1,162 @@
+name: Broken Link Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      runMode:
+        description: "Run mode"
+        required: false
+        default: "all"
+  schedule:
+    - cron: '30 2 * * *'
+
+jobs:
+  linkchecker:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        site:
+          - name: "7.2.0"
+            url: "https://is.docs.wso2.com/en/7.2.0/"
+          - name: "7.1.0"
+            url: "https://is.docs.wso2.com/en/7.1.0/"
+          - name: "7.0.0"
+            url: "https://is.docs.wso2.com/en/7.0.0/"
+          - name: "Asgardeo"
+            url: "https://wso2.com/asgardeo/docs/"
+          - name: "next"
+            url: "https://is.docs.wso2.com/en/next/"
+
+    steps:
+      - name: Disable scheduled runs on forks
+        if: github.event_name == 'schedule' && github.repository != 'wso2/docs-is'
+        run: exit 0
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install linkchecker beautifulsoup4
+
+      - name: Run Link Checker
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          linkchecker -F html ${{ matrix.site.url }} \
+            --threads=100 \
+            --output=reports/raw-${{ matrix.site.name }}.html
+
+      - name: Generate filtered HTML report (inline Python)
+        run: |
+          python << 'EOF'
+          from bs4 import BeautifulSoup
+          import sys
+
+          name = "${{ matrix.site.name }}"
+          url = "${{ matrix.site.url }}"
+          input_file = f"reports/raw-{name}.html"
+          output_file = f"reports/report-{name}.html"
+
+          with open(input_file, "r", encoding="utf-8") as f:
+              soup = BeautifulSoup(f, "html.parser")
+
+          broken_rows = soup.find_all("tr", class_="error")
+
+          final = BeautifulSoup(
+              "<!DOCTYPE html><html><head><title>Broken Link Report</title></head><body></body></html>",
+              "html.parser"
+          )
+
+          h1 = final.new_tag("h1")
+          h1.string = f"Broken Link Checker – {name}"
+          final.body.append(h1)
+
+          p = final.new_tag("p")
+          p.string = f"Site: {url}"
+          final.body.append(p)
+
+          count = final.new_tag("p")
+          count.string = f"Broken links found: {len(broken_rows)}"
+          final.body.append(count)
+
+          final.body.append(final.new_tag("hr"))
+
+          for row in broken_rows:
+              final.body.append(row)
+
+          with open(output_file, "w", encoding="utf-8") as f:
+              f.write(str(final))
+
+          with open("summary.txt", "a") as s:
+              s.write(f"{name}:{len(broken_rows)}\n")
+          EOF
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: broken-links-${{ matrix.site.name }}
+          path: reports/report-${{ matrix.site.name }}.html
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broken-link-summary
+          path: summary.txt
+
+  notify:
+    needs: linkchecker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download summary
+        uses: actions/download-artifact@v4
+        with:
+          name: broken-link-summary
+
+      - name: Send Google Chat notification
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+        run: |
+          SUMMARY=$(awk -F: '{printf "%s : %s broken links\n", $1, $2}' summary.txt)
+
+          MESSAGE=$(cat <<EOF
+          {
+            "cards": [{
+              "header": {
+                "title": "Broken Link Checker Report",
+                "subtitle": "WSO2 Documentation"
+              },
+              "sections": [{
+                "widgets": [{
+                  "textParagraph": {
+                    "text": "<b>Summary</b><br><pre>${SUMMARY}</pre>"
+                  }
+                },{
+                  "buttons": [{
+                    "textButton": {
+                      "text": "DOWNLOAD REPORTS",
+                      "onClick": {
+                        "openLink": {
+                          "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      }
+                    }
+                  }]
+                }]
+              }]
+            }]
+          }
+          EOF
+          )
+
+          curl -X POST -H "Content-Type: application/json" \
+               -d "$MESSAGE" \
+               "$WEBHOOK_URL"
