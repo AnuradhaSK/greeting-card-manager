@@ -3,15 +3,15 @@ name: Broken Link Checker
 on:
   workflow_dispatch:
     inputs:
-        siteUrl:
-          description: 'Site URL to Check'
-          default: 'https://is.docs.wso2.com/en/latest/'
-          required: true
+      siteUrl:
+        description: 'Site URL to Check'
+        default: 'https://is.docs.wso2.com/en/latest/'
+        required: true
   schedule:
-    - cron: '30 2 * * *' # Schedule to run once daily at 02:30 UTC
+    - cron: '30 2 * * *'
 
 env:
-  DEFAULT_URL: 'https://is.docs.wso2.com/en/7.1.0/'
+  DEFAULT_URL: 'https://is.docs.wso2.com/en/latest/'
 
 jobs:
   linkchecker:
@@ -35,49 +35,305 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install linkchecker
-          pip install beautifulsoup4
+          pip install linkchecker beautifulsoup4 playwright requests
+          playwright install chromium --with-deps
 
-      - name: Run Link Checker
+      # Phase 1: Standard linkchecker (catches static links)
+      - name: Run Standard Link Checker
         run: |
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
-          linkchecker -F html $SITE_URL --threads=100
+          linkchecker -F html "$SITE_URL" --threads=100
         continue-on-error: true
 
-      - name: Filter HTML for specific string and preserve page structure
-        id: filter_html
+      # Phase 2: Playwright crawler to extract JS-rendered links and check for soft 404s
+      - name: Run JS-rendered Link Checker
         run: |
-          echo "import sys" > filter_script.py
-          echo "from bs4 import BeautifulSoup" >> filter_script.py
-          echo "website_url = 'https://is.docs.wso2.com/en/latest/'" >> filter_script.py
-          echo "with open('linkchecker-out.html', 'r') as file:" >> filter_script.py
-          echo "    soup = BeautifulSoup(file, 'html.parser')" >> filter_script.py
-          echo "string_to_filter = 'https://is.docs.wso2.com/en/latest/page-not-found'" >> filter_script.py
-          echo "final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')" >> filter_script.py
-          echo "final_soup.head.append(soup.head)" >> filter_script.py
-          echo "# Add custom header, broken link count and spacing" >> filter_script.py
-          echo "header_tag = final_soup.new_tag('h1')" >> filter_script.py
-          echo "header_tag.string = 'Broken Link Checker - ' + website_url" >> filter_script.py
-          echo "final_soup.body.append(header_tag)" >> filter_script.py
-          echo "# Count and append the number of broken links found" >> filter_script.py
-          echo "tables = soup.find_all('table')" >> filter_script.py
-          echo "broken_link_count = sum(string_to_filter in str(table) for table in tables)" >> filter_script.py
-          echo "with open('broken_link_count.txt', 'w') as count_file:" >> filter_script.py
-          echo "    count_file.write(str(broken_link_count))" >> filter_script.py
-          echo "count_tag = final_soup.new_tag('p')" >> filter_script.py
-          echo "count_tag.string = 'Number of broken links found: ' + str(broken_link_count)" >> filter_script.py
-          echo "final_soup.body.append(count_tag)" >> filter_script.py
-          echo "final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "# Append filtered tables" >> filter_script.py
-          echo "for table in tables:" >> filter_script.py
-          echo "    if string_to_filter in str(table):" >> filter_script.py
-          echo "        final_soup.body.append(table)" >> filter_script.py
-          echo "        final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "with open('broken_links_report_IS.html', 'w') as file:" >> filter_script.py
-          echo "    file.write(str(final_soup))" >> filter_script.py
-          python filter_script.py
-  
+          cat > playwright_checker.py << 'PYEOF'
+          import asyncio
+          import json
+          import re
+          import sys
+          from urllib.parse import urljoin, urlparse
+          from playwright.async_api import async_playwright
+          import requests
+
+          BASE_URL = "${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}"
+          SOFT_404_INDICATOR = "page-not-found"
+          MAX_PAGES = 500          # Safety cap on pages crawled
+          CONCURRENCY = 10         # Parallel page checks
+          TIMEOUT = 20000          # 20s per page
+
+          visited_pages = set()
+          broken = []             # {source, url, text}
+          queue = asyncio.Queue()
+
+          def is_internal(url):
+              return url.startswith(BASE_URL)
+
+          def normalize(url):
+              # Strip fragment, trailing slash-normalize
+              u = url.split('#')[0].rstrip('/')
+              return u if u else BASE_URL.rstrip('/')
+
+          async def check_link(session, href, source_url, link_text):
+              """Return True if the link is broken (soft 404 or hard error)."""
+              try:
+                  r = session.get(href, timeout=15, allow_redirects=True)
+                  final_url = r.url
+                  if SOFT_404_INDICATOR in final_url:
+                      return True
+              except Exception:
+                  return True
+              return False
+
+          async def crawl(page, url, session, sem):
+              async with sem:
+                  norm = normalize(url)
+                  if norm in visited_pages or len(visited_pages) >= MAX_PAGES:
+                      return
+                  visited_pages.add(norm)
+
+                  try:
+                      await page.goto(url, wait_until='networkidle', timeout=TIMEOUT)
+                  except Exception:
+                      try:
+                          await page.goto(url, wait_until='domcontentloaded', timeout=TIMEOUT)
+                      except Exception:
+                          return
+
+                  # Check if THIS page is a soft 404
+                  if SOFT_404_INDICATOR in page.url:
+                      return
+
+                  # Extract all <a href> links after JS rendering
+                  links = await page.eval_on_selector_all(
+                      'a[href]',
+                      'els => els.map(e => ({href: e.href, text: e.innerText.trim()}))'
+                  )
+
+                  tasks = []
+                  child_pages = []
+
+                  for link in links:
+                      href = link.get('href', '').strip()
+                      text = link.get('text', '')
+                      if not href or href.startswith('mailto:') or href.startswith('javascript:'):
+                          continue
+
+                      full_href = urljoin(url, href).split('#')[0]
+                      if not full_href.startswith('http'):
+                          continue
+
+                      # Queue internal pages for crawling
+                      if is_internal(full_href) and normalize(full_href) not in visited_pages:
+                          child_pages.append(full_href)
+
+                      # Check all links (internal + external) for soft 404
+                      tasks.append((href, text))
+
+                  # Check links concurrently using requests (sync in thread)
+                  loop = asyncio.get_event_loop()
+                  for href, text in tasks:
+                      full_href = urljoin(url, href).split('#')[0]
+                      is_broken = await loop.run_in_executor(
+                          None, lambda h=full_href, s=url, t=text: 
+                              requests.get(h, timeout=15, allow_redirects=True).url
+                      )
+                      # Check soft 404
+                      try:
+                          final = await loop.run_in_executor(
+                              None, lambda h=full_href: requests.get(h, timeout=15, allow_redirects=True).url
+                          )
+                          if SOFT_404_INDICATOR in final:
+                              broken.append({
+                                  'source': url,
+                                  'url': full_href,
+                                  'text': text
+                              })
+                      except Exception:
+                          broken.append({
+                              'source': url,
+                              'url': full_href,
+                              'text': text,
+                              'error': 'request_failed'
+                          })
+
+                  for child in child_pages:
+                      await queue.put(child)
+
+          async def worker(browser, session, sem):
+              page = await browser.new_page()
+              while True:
+                  try:
+                      url = queue.get_nowait()
+                  except asyncio.QueueEmpty:
+                      break
+                  await crawl(page, url, session, sem)
+                  queue.task_done()
+              await page.close()
+
+          async def main():
+              await queue.put(BASE_URL)
+              session = requests.Session()
+              session.headers['User-Agent'] = 'Mozilla/5.0 BrokenLinkChecker/2.0'
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  sem = asyncio.Semaphore(CONCURRENCY)
+
+                  while not queue.empty() and len(visited_pages) < MAX_PAGES:
+                      batch = []
+                      while not queue.empty() and len(batch) < CONCURRENCY:
+                          try:
+                              url = queue.get_nowait()
+                              batch.append(url)
+                          except asyncio.QueueEmpty:
+                              break
+
+                      if not batch:
+                          break
+
+                      pages = [await browser.new_page() for _ in batch]
+                      tasks = [crawl(p, u, session, sem) for p, u in zip(pages, batch)]
+                      await asyncio.gather(*tasks)
+                      for p in pages:
+                          await p.close()
+
+                  await browser.close()
+
+              # Deduplicate broken links
+              seen = set()
+              unique_broken = []
+              for b in broken:
+                  key = (b['source'], b['url'])
+                  if key not in seen:
+                      seen.add(key)
+                      unique_broken.append(b)
+
+              with open('playwright_broken_links.json', 'w') as f:
+                  json.dump(unique_broken, f, indent=2)
+
+              print(f"Pages crawled: {len(visited_pages)}")
+              print(f"Broken links found: {len(unique_broken)}")
+
+          asyncio.run(main())
+          PYEOF
+          python playwright_checker.py
+        continue-on-error: true
+
+      # Merge both reports into one HTML
+      - name: Merge and Filter Reports
+        id: merge_reports
+        run: |
+          cat > merge_reports.py << 'PYEOF'
+          import json
+          from bs4 import BeautifulSoup
+
+          SITE_URL       = "${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}"
+          SOFT_404_STR   = "page-not-found"
+          OUT_FILE       = "broken_links_report_IS.html"
+
+          # ── 1. Parse linkchecker HTML output ──────────────────────────────────
+          lc_broken = []
+          try:
+              with open('linkchecker-out.html', 'r') as f:
+                  soup = BeautifulSoup(f, 'html.parser')
+              lc_tables = [t for t in soup.find_all('table') if SOFT_404_STR in str(t)]
+              lc_broken_tables = lc_tables          # kept for raw embed in report
+          except FileNotFoundError:
+              lc_broken_tables = []
+
+          # ── 2. Parse Playwright JSON output ───────────────────────────────────
+          pw_broken = []
+          try:
+              with open('playwright_broken_links.json', 'r') as f:
+                  pw_broken = json.load(f)
+          except FileNotFoundError:
+              pass
+
+          # ── 3. Build combined HTML report ─────────────────────────────────────
+          final = BeautifulSoup(
+              '<!DOCTYPE html><html><head><style>'
+              'body{font-family:Arial,sans-serif;margin:2em}'
+              'h1{color:#c0392b} h2{color:#2c3e50;margin-top:2em}'
+              'table{border-collapse:collapse;width:100%;margin-bottom:1em}'
+              'th{background:#2c3e50;color:#fff;padding:8px;text-align:left}'
+              'td{padding:8px;border:1px solid #ddd;word-break:break-all}'
+              'tr:nth-child(even){background:#f9f9f9}'
+              '.badge{background:#e74c3c;color:#fff;border-radius:4px;padding:2px 8px;font-size:.9em}'
+              '</style></head><body></body></html>',
+              'html.parser'
+          )
+          body = final.body
+
+          # Header
+          h1 = final.new_tag('h1')
+          h1.string = f'Broken Link Checker Report – {SITE_URL}'
+          body.append(h1)
+
+          total = len(lc_broken_tables) + len(pw_broken)
+          summary = final.new_tag('p')
+          badge = final.new_tag('span', attrs={'class': 'badge'})
+          badge.string = str(total)
+          summary.append(badge)
+          summary.append(f'  total broken links found')
+          body.append(summary)
+
+          # ── Section A: linkchecker results ────────────────────────────────────
+          h2a = final.new_tag('h2')
+          h2a.string = f'Static Link Checker Results ({len(lc_broken_tables)} broken)'
+          body.append(h2a)
+
+          if lc_broken_tables:
+              for t in lc_broken_tables:
+                  body.append(t)
+                  body.append(final.new_tag('br'))
+          else:
+              p = final.new_tag('p')
+              p.string = 'No broken links detected by static checker.'
+              body.append(p)
+
+          # ── Section B: Playwright (JS-rendered) results ───────────────────────
+          h2b = final.new_tag('h2')
+          h2b.string = f'JS-Rendered Page Checker Results ({len(pw_broken)} broken)'
+          body.append(h2b)
+
+          if pw_broken:
+              table = final.new_tag('table')
+              # Header row
+              thead = final.new_tag('tr')
+              for col in ['Source Page', 'Broken URL', 'Link Text']:
+                  th = final.new_tag('th')
+                  th.string = col
+                  thead.append(th)
+              table.append(thead)
+
+              for item in pw_broken:
+                  tr = final.new_tag('tr')
+                  for val in [item.get('source',''), item.get('url',''), item.get('text','')]:
+                      td = final.new_tag('td')
+                      a  = final.new_tag('a', href=val if val.startswith('http') else '#')
+                      a.string = val or '–'
+                      td.append(a)
+                      tr.append(td)
+                  table.append(tr)
+              body.append(table)
+          else:
+              p = final.new_tag('p')
+              p.string = 'No additional broken links found by JS-rendered checker.'
+              body.append(p)
+
+          with open(OUT_FILE, 'w') as f:
+              f.write(str(final))
+
+          # Write count for notification step
+          with open('broken_link_count.txt', 'w') as f:
+              f.write(str(total))
+
+          print(f"Report written → {OUT_FILE}  (total broken: {total})")
+          PYEOF
+          python merge_reports.py
+
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
           echo "broken_links_count=$BROKEN_LINKS_COUNT" >> $GITHUB_ENV
 
@@ -134,4 +390,5 @@ jobs:
           }
           EOF
           )
-          curl -X POST -H 'Content-Type: application/json' -d "$MESSAGE_JSON" "$WEBHOOK_URL&threadKey=$THREAD_NAME&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+          curl -X POST -H 'Content-Type: application/json' -d "$MESSAGE_JSON" \
+            "$WEBHOOK_URL&threadKey=$THREAD_NAME&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
