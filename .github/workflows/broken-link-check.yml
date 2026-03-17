@@ -3,12 +3,12 @@ name: Broken Link Checker
 on:
   workflow_dispatch:
     inputs:
-      siteUrl:
-        description: 'Site URL to Check'
-        default: 'https://is.docs.wso2.com/en/latest/'
-        required: true
+        siteUrl:
+          description: 'Site URL to Check'
+          default: 'https://is.docs.wso2.com/en/latest/'
+          required: true
   schedule:
-    - cron: '30 2 * * *' # Run once daily at 02:30 UTC
+    - cron: '30 2 * * *' # Schedule to run once daily at 02:30 UTC
 
 env:
   DEFAULT_URL: 'https://is.docs.wso2.com/en/latest/'
@@ -18,7 +18,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── Guard: disable scheduled runs on forks ────────────────────────────────
       - name: Check repository
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] && [ "$GITHUB_REPOSITORY" != "wso2/docs-is" ]; then
@@ -38,341 +37,159 @@ jobs:
         run: |
           pip install linkchecker beautifulsoup4 requests
 
-      # ── Phase 1: Standard linkchecker (catches static/crawlable links) ────────
-      - name: Run Standard Link Checker
+      - name: Run Link Checker
         run: |
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
-          linkchecker -F html "$SITE_URL" --threads=100
+          linkchecker -F html $SITE_URL --threads=100
         continue-on-error: true
 
-      # ── Phase 2: Source Markdown link checker ─────────────────────────────────
-      # Reads every .md file in the repo, resolves all relative links to absolute
-      # URLs the same way MkDocs does, then checks each for hard errors (4xx/5xx)
-      # and WSO2-style soft 404s (URL contains "page-not-found").
-      # This catches links inside card grids, macros, and any JS-rendered sections
-      # that the standard crawler cannot see.
-      - name: Run Source Markdown Link Checker
+      - name: Write filter and soft-404 detection script
         run: |
-          cat > md_link_checker.py << 'PYEOF'
-          import os
-          import re
-          import json
-          import requests
-          from pathlib import Path
-          from urllib.parse import urljoin
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-
-          # ── Configuration ──────────────────────────────────────────────────────
-          DOCS_DIR        = Path("en/docs")
-          BASE_URL        = "${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}"
-          if not BASE_URL.endswith("/"):
-              BASE_URL += "/"
-          SOFT_404        = "page-not-found"
-          MAX_WORKERS     = 30
-          REQUEST_TIMEOUT = 15
-
-          # Patterns to extract links from Markdown and inline HTML
-          MD_LINK_RE   = re.compile(r'\[([^\]]*)\]\(([^)#\s][^)\s]*)\)')
-          HTML_HREF_RE = re.compile(r'href=["\']([^"\'#][^"\']*)["\']')
-
-          # Skip asset files — we only care about navigable pages
-          SKIP_EXTENSIONS = {
-              ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
-              ".pdf", ".zip", ".tar", ".gz", ".mp4", ".mp3",
-              ".ico", ".woff", ".woff2", ".ttf", ".eot", ".css", ".js",
-          }
-
-          session = requests.Session()
-          session.headers["User-Agent"] = "WSO2-BrokenLinkChecker/3.0"
-
-          # ── Helpers ────────────────────────────────────────────────────────────
-          def md_file_to_url(md_path: Path) -> str:
-              """
-              Map a repository .md file to its published URL.
-              en/docs/guides/agentic-ai/mcp.md  →  BASE_URL + guides/agentic-ai/mcp/
-              en/docs/guides/index.md            →  BASE_URL + guides/
-              """
-              rel   = md_path.relative_to(DOCS_DIR)
-              parts = list(rel.parts)
-              if parts[-1].lower() in ("index.md", "readme.md"):
-                  parts = parts[:-1]
-              else:
-                  parts[-1] = parts[-1][:-3]          # strip .md
-              return BASE_URL + "/".join(parts) + ("/" if parts else "")
-
-          def should_skip(href: str) -> bool:
-              """Return True for links we never want to check."""
-              if href.startswith(("mailto:", "javascript:", "tel:", "#", "{")):
-                  return True
-              ext = os.path.splitext(href.split("?")[0])[-1].lower()
-              if ext in SKIP_EXTENSIONS:
-                  return True
-              return False
-
-          def resolve(raw_href: str, source_md: Path) -> str | None:
-              """
-              Turn a raw href into a fully-qualified URL.
-              Relative paths are resolved against the page's published URL,
-              exactly as MkDocs does at build time.
-              """
-              href = raw_href.strip().split("#")[0].split("?")[0]
-              if not href or should_skip(href):
-                  return None
-              if href.startswith(("http://", "https://")):
-                  return href
-              page_url = md_file_to_url(source_md)
-              return urljoin(page_url, href)
-
-          def check_url(url: str) -> tuple[str, bool, str]:
-              """Returns (url, is_broken, reason)."""
-              try:
-                  r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                  if SOFT_404 in r.url:
-                      return url, True, f"soft-404 → {r.url}"
-                  if r.status_code >= 400:
-                      return url, True, f"HTTP {r.status_code}"
-                  return url, False, ""
-              except requests.exceptions.Timeout:
-                  return url, True, "timeout"
-              except Exception as exc:
-                  return url, True, f"error: {exc}"
-
-          # ── Collect all links from all .md files ───────────────────────────────
-          to_check: list[dict] = []
-
-          if not DOCS_DIR.is_dir():
-              print(f"WARNING: {DOCS_DIR} not found — skipping source MD check.")
-          else:
-              for md_path in sorted(DOCS_DIR.rglob("*.md")):
-                  text = md_path.read_text(encoding="utf-8", errors="replace")
-
-                  found: list[tuple[str, str]] = []
-                  for m in MD_LINK_RE.finditer(text):
-                      found.append((m.group(1), m.group(2)))
-                  for m in HTML_HREF_RE.finditer(text):
-                      found.append(("", m.group(1)))
-
-                  for link_text, raw_href in found:
-                      resolved = resolve(raw_href, md_path)
-                      if resolved:
-                          to_check.append({
-                              "source_file": str(md_path),
-                              "source_url":  md_file_to_url(md_path),
-                              "link_text":   link_text.strip(),
-                              "href_raw":    raw_href,
-                              "resolved_url": resolved,
-                          })
-
-          print(f"Found {len(to_check)} links across {DOCS_DIR} — checking...")
-
-          # ── Check each unique URL once, in parallel ────────────────────────────
-          unique_urls  = list({item["resolved_url"] for item in to_check})
-          broken_urls: dict[str, str] = {}   # url → reason
-
-          with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-              futures = {ex.submit(check_url, url): url for url in unique_urls}
-              done = 0
-              for future in as_completed(futures):
-                  url, is_broken, reason = future.result()
-                  done += 1
-                  if done % 100 == 0:
-                      print(f"  checked {done}/{len(unique_urls)} unique URLs ...")
-                  if is_broken:
-                      broken_urls[url] = reason
-
-          # ── Emit one row per source occurrence of a broken URL ─────────────────
-          broken_rows = [
-              {**item, "reason": broken_urls[item["resolved_url"]]}
-              for item in to_check
-              if item["resolved_url"] in broken_urls
-          ]
-
-          with open("md_broken_links.json", "w") as f:
-              json.dump(broken_rows, f, indent=2)
-
-          print(f"\nBroken links: {len(broken_rows)} occurrences "
-                f"({len(broken_urls)} unique URLs)")
-          PYEOF
-          python md_link_checker.py
-        continue-on-error: true
-
-      # ── Merge both reports into a single HTML file ────────────────────────────
-      - name: Merge and Build Report
-        id: build_report
-        run: |
-          cat > merge_reports.py << 'PYEOF'
-          import json
+          cat > filter_script.py << 'PYEOF'
           from bs4 import BeautifulSoup
+          import requests
+          import re
 
-          SITE_URL   = "${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}"
-          SOFT_404   = "page-not-found"
-          OUT_FILE   = "broken_links_report_IS.html"
+          SITE_BASE = 'https://is.docs.wso2.com/en/latest/'
+          PAGE_NOT_FOUND_URL = 'https://is.docs.wso2.com/en/latest/page-not-found'
+          REPORT_INPUT = 'linkchecker-out.html'
+          REPORT_OUTPUT = 'broken_links_report_IS.html'
 
-          CSS = """
-          body  { font-family: Arial, sans-serif; margin: 2em; color: #222; }
-          h1    { color: #c0392b; }
-          h2    { color: #2c3e50; margin-top: 2.5em; border-bottom: 2px solid #ecf0f1; padding-bottom: .3em; }
-          p     { margin: .5em 0; }
-          .badge{ background: #e74c3c; color: #fff; border-radius: 4px;
-                  padding: 2px 10px; font-size: .95em; font-weight: bold; }
-          .zero { background: #27ae60; }
-          table { border-collapse: collapse; width: 100%; margin-bottom: 1.5em; font-size: .9em; }
-          th    { background: #2c3e50; color: #fff; padding: 8px 10px; text-align: left; }
-          td    { padding: 7px 10px; border: 1px solid #ddd; word-break: break-all; }
-          tr:nth-child(even) td { background: #f7f9fa; }
-          a     { color: #2980b9; }
-          """
+          # ---------------------------------------------------------------
+          # Soft-404 check: request the URL and see if the server silently
+          # redirects to /page-not-found/. This catches pages that don't
+          # exist yet but return HTTP 200 instead of a real 404 — which
+          # means linkchecker considers them valid and never flags them.
+          #
+          # This is exactly why links like "MCP Server Quick Start -
+          # TypeScript/Python" listed under the #whats-next section go
+          # undetected: they are real hrefs pointing to pages that haven't
+          # been created, the server redirects to /page-not-found/ with a
+          # 200, so linkchecker sees 200 and moves on.
+          # ---------------------------------------------------------------
+          def is_soft_404(url):
+              """Return True if the URL ultimately resolves to the
+              page-not-found page, regardless of the HTTP status code."""
+              # Strip fragment — fragments are client-side only, the server
+              # never sees them, so we just need to verify the page exists.
+              bare_url = url.split('#')[0]
+              try:
+                  resp = requests.get(bare_url, allow_redirects=True, timeout=15)
+                  return PAGE_NOT_FOUND_URL in resp.url
+              except Exception:
+                  return False
 
-          # ── 1. Parse linkchecker HTML output ───────────────────────────────────
-          lc_broken_tables = []
-          try:
-              with open("linkchecker-out.html", "r") as f:
-                  lc_soup = BeautifulSoup(f, "html.parser")
-              lc_broken_tables = [
-                  t for t in lc_soup.find_all("table")
-                  if SOFT_404 in str(t)
-              ]
-          except FileNotFoundError:
-              pass
+          # ---------------------------------------------------------------
+          # Parse the linkchecker HTML report
+          # ---------------------------------------------------------------
+          with open(REPORT_INPUT, 'r', encoding='utf-8') as f:
+              soup = BeautifulSoup(f, 'html.parser')
 
-          # ── 2. Parse source-MD JSON output ─────────────────────────────────────
-          md_broken = []
-          try:
-              with open("md_broken_links.json", "r") as f:
-                  md_broken = json.load(f)
-          except FileNotFoundError:
-              pass
+          tables = soup.find_all('table')
 
-          # ── 3. Build HTML report ────────────────────────────────────────────────
-          total = len(lc_broken_tables) + len(md_broken)
+          # ---------------------------------------------------------------
+          # Two-pass broken link detection:
+          #
+          # Pass 1 (original): linkchecker already logged /page-not-found
+          #   in the report — keep that behaviour unchanged.
+          #
+          # Pass 2 (new): for every internal link found in each table that
+          #   linkchecker did NOT flag, do a live soft-404 check. This is
+          #   what catches the "MCP Server Quick Start" links and any other
+          #   pages that the site serves as a 200 /page-not-found/.
+          # ---------------------------------------------------------------
+          broken_tables = []
+          checked_urls = {}  # cache to avoid re-requesting the same URL
 
-          doc = BeautifulSoup(
-              f"<!DOCTYPE html><html><head>"
-              f"<meta charset='utf-8'>"
-              f"<title>Broken Link Report – WSO2 IS</title>"
-              f"<style>{CSS}</style>"
-              f"</head><body></body></html>",
-              "html.parser"
+          for table in tables:
+              table_str = str(table)
+
+              # Pass 1 — already flagged by linkchecker
+              if PAGE_NOT_FOUND_URL in table_str:
+                  broken_tables.append({
+                      'table': table,
+                      'reason': 'linkchecker detected redirect to /page-not-found/',
+                      'url': None
+                  })
+                  continue
+
+              # Pass 2 — extract all internal hrefs from the table and
+              # check each one live for a soft-404.
+              internal_links = re.findall(
+                  r'https://is\.docs\.wso2\.com/en/latest/[^\s"\'<>]+',
+                  table_str
+              )
+
+              found_soft_404 = None
+              for link in internal_links:
+                  bare = link.split('#')[0].rstrip('/')
+                  if bare not in checked_urls:
+                      checked_urls[bare] = is_soft_404(link)
+                  if checked_urls[bare]:
+                      found_soft_404 = link
+                      break
+
+              if found_soft_404:
+                  broken_tables.append({
+                      'table': table,
+                      'reason': f'page does not exist (soft 404): {found_soft_404}',
+                      'url': found_soft_404
+                  })
+
+          # ---------------------------------------------------------------
+          # Build the output HTML report
+          # ---------------------------------------------------------------
+          final_soup = BeautifulSoup(
+              '<!DOCTYPE html><html><head></head><body></body></html>',
+              'html.parser'
           )
-          body = doc.body
+          final_soup.head.append(soup.head)
 
-          # Title
-          h1 = doc.new_tag("h1")
-          h1.string = f"Broken Link Checker Report – {SITE_URL}"
-          body.append(h1)
+          h1 = final_soup.new_tag('h1')
+          h1.string = f'Broken Link Checker - {SITE_BASE}'
+          final_soup.body.append(h1)
 
-          # Summary badge
-          summary = doc.new_tag("p")
-          badge = doc.new_tag("span", attrs={"class": "badge" + (" zero" if total == 0 else "")})
-          badge.string = str(total)
-          summary.append(badge)
-          summary.append(f"  total broken link{'s' if total != 1 else ''} found")
-          body.append(summary)
+          count_p = final_soup.new_tag('p')
+          count_p.string = f'Number of broken links found: {len(broken_tables)}'
+          final_soup.body.append(count_p)
+          final_soup.body.append(final_soup.new_tag('br'))
 
-          # ── Section A: linkchecker results ─────────────────────────────────────
-          h2a = doc.new_tag("h2")
-          h2a.string = f"Phase 1 — Static Crawler Results  ({len(lc_broken_tables)} broken)"
-          body.append(h2a)
+          for entry in broken_tables:
+              reason_p = final_soup.new_tag('p')
+              reason_p.string = f'Detected via: {entry["reason"]}'
+              final_soup.body.append(reason_p)
+              final_soup.body.append(entry['table'])
+              final_soup.body.append(final_soup.new_tag('br'))
 
-          if lc_broken_tables:
-              for t in lc_broken_tables:
-                  body.append(t)
-                  body.append(doc.new_tag("br"))
-          else:
-              p = doc.new_tag("p")
-              p.string = "No broken links detected by the static crawler."
-              body.append(p)
+          with open(REPORT_OUTPUT, 'w', encoding='utf-8') as f:
+              f.write(str(final_soup))
 
-          # ── Section B: source-MD results ───────────────────────────────────────
-          h2b = doc.new_tag("h2")
-          h2b.string = f"Phase 2 — Source Markdown Results  ({len(md_broken)} broken occurrences)"
-          body.append(h2b)
+          with open('broken_link_count.txt', 'w') as f:
+              f.write(str(len(broken_tables)))
 
-          if md_broken:
-              table = doc.new_tag("table")
-
-              # Header row
-              thead_tr = doc.new_tag("tr")
-              for col in ["Source .md File", "Source Page URL", "Link Text", "Raw Link in Source", "Resolved URL", "Reason"]:
-                  th = doc.new_tag("th")
-                  th.string = col
-                  thead_tr.append(th)
-              table.append(thead_tr)
-
-              for item in md_broken:
-                  tr = doc.new_tag("tr")
-
-                  # Source .md file (plain text)
-                  td1 = doc.new_tag("td")
-                  td1.string = item.get("source_file", "")
-                  tr.append(td1)
-
-                  # Source page URL (linked)
-                  td2 = doc.new_tag("td")
-                  src_url = item.get("source_url", "")
-                  a2 = doc.new_tag("a", href=src_url, target="_blank")
-                  a2.string = src_url
-                  td2.append(a2)
-                  tr.append(td2)
-
-                  # Link text
-                  td3 = doc.new_tag("td")
-                  td3.string = item.get("link_text", "") or "–"
-                  tr.append(td3)
-
-                  # Raw link as written in the .md source
-                  td4 = doc.new_tag("td")
-                  td4.string = item.get("href_raw", "")
-                  tr.append(td4)
-
-                  # Resolved (absolute) URL (linked)
-                  td5 = doc.new_tag("td")
-                  res_url = item.get("resolved_url", "")
-                  a5 = doc.new_tag("a", href=res_url, target="_blank")
-                  a5.string = res_url
-                  td5.append(a5)
-                  tr.append(td5)
-
-                  # Reason (soft-404 / HTTP code / error)
-                  td6 = doc.new_tag("td")
-                  td6.string = item.get("reason", "")
-                  tr.append(td6)
-
-                  table.append(tr)
-
-              body.append(table)
-          else:
-              p = doc.new_tag("p")
-              p.string = "No broken links detected in the source Markdown files."
-              body.append(p)
-
-          # Write report + count
-          with open(OUT_FILE, "w", encoding="utf-8") as f:
-              f.write(str(doc))
-
-          with open("broken_link_count.txt", "w") as f:
-              f.write(str(total))
-
-          print(f"Report → {OUT_FILE}   (total broken: {total})")
+          print(f'Done. Broken links found: {len(broken_tables)}')
           PYEOF
-          python merge_reports.py
 
-          echo "broken_links_count=$(cat broken_link_count.txt)" >> $GITHUB_ENV
+      - name: Filter HTML report
+        id: filter_html
+        run: |
+          python filter_script.py
 
-      # ── Upload report artifact ─────────────────────────────────────────────────
-      - name: Upload HTML Report as Artifact
+          BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
+          echo "broken_links_count=$BROKEN_LINKS_COUNT" >> $GITHUB_ENV
+
+      - name: Upload HTML as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: broken_links_report_IS
           path: broken_links_report_IS.html
 
-      # ── Notify Google Chat ─────────────────────────────────────────────────────
       - name: Notify Google Chat
         env:
-          WEBHOOK_URL:         ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
-          SITE_URL:            ${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
-          THREAD_NAME:         "BrokenLinkCheckerWSO2IS"
-          BROKEN_LINKS_COUNT:  ${{ env.broken_links_count }}
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+          SITE_URL: ${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
+          THREAD_NAME: "BrokenLinkCheckerWSO2IS"
+          BROKEN_LINKS_COUNT: ${{ env.broken_links_count }}
         run: |
           MESSAGE_JSON=$(cat <<EOF
           {
@@ -414,5 +231,4 @@ jobs:
           }
           EOF
           )
-          curl -X POST -H 'Content-Type: application/json' -d "$MESSAGE_JSON" \
-            "$WEBHOOK_URL&threadKey=$THREAD_NAME&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+          curl -X POST -H 'Content-Type: application/json' -d "$MESSAGE_JSON" "$WEBHOOK_URL&threadKey=$THREAD_NAME&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
