@@ -99,12 +99,22 @@ jobs:
 
               if is_soft_404 or is_hard_failure:
                   broken_urls.add(urlname)
+                  broken_urls.add(final_url)
 
           with open('linkchecker-out.html', 'r', encoding='utf-8') as html_file:
               soup = BeautifulSoup(html_file, 'html.parser')
 
           tables = soup.find_all('table')
-          broken_tables = [table for table in tables if any(url in str(table) for url in broken_urls)]
+          broken_tables = []
+          for table in tables:
+              table_str = str(table)
+              has_known_broken_url = any(url and url in table_str for url in broken_urls)
+              # Keep explicit soft-404 table matching so redirected links that
+              # end on /page-not-found/ are always included even if linkchecker
+              # reports them as Valid: 200 OK.
+              has_soft_404_marker = PAGE_NOT_FOUND in table_str
+              if has_known_broken_url or has_soft_404_marker:
+                  broken_tables.append(table)
 
           final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')
           final_soup.head.append(soup.head)
