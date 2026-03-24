@@ -35,63 +35,123 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install linkchecker
-          pip install beautifulsoup4
+          pip install linkchecker beautifulsoup4
 
       - name: Run Link Checker
         run: |
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
-          # --check-extern: also checks external links (e.g. http://wso2.com/...),
-          # not just internal ones. Without this flag, linkchecker silently skips
-          # every link pointing outside is.docs.wso2.com, which is why broken
-          # external links like http://wso2.com/products/identity-server/ were
-          # never caught.
-          linkchecker --check-extern -F html $SITE_URL --threads=100
+          # --check-extern: check external links too (e.g. http://wso2.com/...)
+          # -F csv: machine-readable output used by the filter script to detect
+          #         broken links precisely via the result column (True/False),
+          #         avoiding the false positives of string-matching on HTML
+          # -F html: human-readable report preserved for the artifact upload
+          linkchecker --check-extern -F csv -F html $SITE_URL --threads=100
         continue-on-error: true
 
-      - name: Filter HTML for specific string and preserve page structure
+      - name: Filter broken links and build report
         id: filter_html
         run: |
-          echo "import sys" > filter_script.py
-          echo "from bs4 import BeautifulSoup" >> filter_script.py
-          echo "website_url = 'https://is.docs.wso2.com/en/latest/'" >> filter_script.py
-          echo "with open('linkchecker-out.html', 'r') as file:" >> filter_script.py
-          echo "    soup = BeautifulSoup(file, 'html.parser')" >> filter_script.py
-          echo "string_to_filter = 'https://is.docs.wso2.com/en/latest/page-not-found'" >> filter_script.py
-          echo "final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')" >> filter_script.py
-          echo "final_soup.head.append(soup.head)" >> filter_script.py
-          echo "# Add custom header, broken link count and spacing" >> filter_script.py
-          echo "header_tag = final_soup.new_tag('h1')" >> filter_script.py
-          echo "header_tag.string = 'Broken Link Checker - ' + website_url" >> filter_script.py
-          echo "final_soup.body.append(header_tag)" >> filter_script.py
-          echo "# Collect broken tables:" >> filter_script.py
-          echo "# 1. Internal soft-404s: links that redirect to /page-not-found/ with HTTP 200" >> filter_script.py
-          echo "# 2. External hard errors: real 4xx/5xx responses now visible because" >> filter_script.py
-          echo "#    --check-extern is enabled. linkchecker writes 'Not Found' or" >> filter_script.py
-          echo "#    'Forbidden' into the Result column for these." >> filter_script.py
-          echo "tables = soup.find_all('table')" >> filter_script.py
-          echo "def is_broken(table):" >> filter_script.py
-          echo "    t = str(table)" >> filter_script.py
-          echo "    is_soft_404 = string_to_filter in t" >> filter_script.py
-          echo "    is_external_error = any(s in t for s in ['Not Found', 'Forbidden']) and not is_soft_404" >> filter_script.py
-          echo "    return is_soft_404 or is_external_error" >> filter_script.py
-          echo "broken_tables = [t for t in tables if is_broken(t)]" >> filter_script.py
-          echo "broken_link_count = len(broken_tables)" >> filter_script.py
-          echo "with open('broken_link_count.txt', 'w') as count_file:" >> filter_script.py
-          echo "    count_file.write(str(broken_link_count))" >> filter_script.py
-          echo "count_tag = final_soup.new_tag('p')" >> filter_script.py
-          echo "count_tag.string = 'Number of broken links found: ' + str(broken_link_count)" >> filter_script.py
-          echo "final_soup.body.append(count_tag)" >> filter_script.py
-          echo "final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "# Append filtered tables" >> filter_script.py
-          echo "for table in broken_tables:" >> filter_script.py
-          echo "    final_soup.body.append(table)" >> filter_script.py
-          echo "    final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "with open('broken_links_report_IS.html', 'w') as file:" >> filter_script.py
-          echo "    file.write(str(final_soup))" >> filter_script.py
+          cat > filter_script.py << 'PYEOF'
+          import csv
+          from bs4 import BeautifulSoup
+
+          SITE_BASE   = 'https://is.docs.wso2.com/en/latest/'
+          PAGE_NOT_FOUND = SITE_BASE + 'page-not-found'
+          CSV_IN      = 'linkchecker-out.csv'
+          HTML_IN     = 'linkchecker-out.html'
+          HTML_OUT    = 'broken_links_report_IS.html'
+
+          # ------------------------------------------------------------------
+          # Step 1: Parse the CSV to build the exact set of broken URLs.
+          #
+          # linkchecker CSV columns (semicolon-separated):
+          #   urlname ; parentname ; base ; result ; warningstring ;
+          #   infostring ; valid ; url ; line ; col ; name
+          #
+          # The "valid" column is the authoritative flag:
+          #   "True"  = link is OK
+          #   "False" = link is broken (real HTTP error OR any other failure)
+          #
+          # Using CSV instead of HTML string-matching is what eliminates both
+          # problems seen before:
+          #   - False positives: "Not Found" / "Forbidden" appearing in page
+          #     content or link text caused the HTML filter to flag valid links.
+          #   - False negatives: external links returning real 404s were only
+          #     caught once --check-extern was added; now with the valid column
+          #     we catch ALL failures regardless of their type or origin.
+          #
+          # Additionally, a soft-404 check covers the WSO2 docs pattern where
+          # missing pages return HTTP 200 but redirect to /page-not-found/.
+          # linkchecker sees 200 and marks the link valid=True, so we
+          # explicitly check whether the reported URL or its real URL contains
+          # the page-not-found path.
+          # ------------------------------------------------------------------
+          broken_urls = set()
+
+          with open(CSV_IN, newline='', encoding='utf-8') as f:
+              for line in f:
+                  if line.startswith('#') or not line.strip():
+                      continue
+                  row = [c.strip() for c in line.split(';')]
+                  if len(row) < 8:
+                      continue
+                  urlname, parentname, base, result, warningstring, infostring, valid, url = row[:8]
+
+                  # Hard failures reported by linkchecker (covers external 404s
+                  # and any other connection / HTTP errors)
+                  if valid.strip() == 'False':
+                      broken_urls.add(urlname)
+
+                  # Soft-404: linkchecker got a 200 but the final URL is the
+                  # WSO2 page-not-found page
+                  if PAGE_NOT_FOUND in url or PAGE_NOT_FOUND in urlname:
+                      broken_urls.add(urlname)
+
+          # ------------------------------------------------------------------
+          # Step 2: Use the broken URL set to filter tables from the HTML
+          # report. Each table in linkchecker's HTML output corresponds to one
+          # checked URL, and the URL itself appears as a link in the table.
+          # We match on the exact URL string so there are no false positives.
+          # ------------------------------------------------------------------
+          with open(HTML_IN, 'r', encoding='utf-8') as f:
+              soup = BeautifulSoup(f, 'html.parser')
+
+          tables = soup.find_all('table')
+          broken_tables = [t for t in tables if any(url in str(t) for url in broken_urls)]
+
+          # ------------------------------------------------------------------
+          # Step 3: Build the output report
+          # ------------------------------------------------------------------
+          final_soup = BeautifulSoup(
+              '<!DOCTYPE html><html><head></head><body></body></html>',
+              'html.parser'
+          )
+          final_soup.head.append(soup.head)
+
+          h1 = final_soup.new_tag('h1')
+          h1.string = 'Broken Link Checker - ' + SITE_BASE
+          final_soup.body.append(h1)
+
+          count_p = final_soup.new_tag('p')
+          count_p.string = f'Number of broken links found: {len(broken_tables)}'
+          final_soup.body.append(count_p)
+          final_soup.body.append(final_soup.new_tag('br'))
+
+          for table in broken_tables:
+              final_soup.body.append(table)
+              final_soup.body.append(final_soup.new_tag('br'))
+
+          final_soup.body.append(final_soup.new_tag('br'))
+
+          with open(HTML_OUT, 'w', encoding='utf-8') as f:
+              f.write(str(final_soup))
+
+          with open('broken_link_count.txt', 'w') as f:
+              f.write(str(len(broken_tables)))
+          PYEOF
+
           python filter_script.py
-  
+
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
           echo "broken_links_count=$BROKEN_LINKS_COUNT" >> $GITHUB_ENV
 
