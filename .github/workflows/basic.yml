@@ -55,10 +55,18 @@ jobs:
         run: |
           cat > filter_script.py << 'PYEOF'
           import csv
+          import os
+          from urllib.parse import urlparse
           from bs4 import BeautifulSoup
 
-          WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
-          PAGE_NOT_FOUND_PATH = '/en/latest/page-not-found/'
+          WEBSITE_URL = os.environ.get('SITE_URL', 'https://is.docs.wso2.com/en/latest/').strip()
+          if not WEBSITE_URL:
+              WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
+          WEBSITE_URL = WEBSITE_URL.rstrip('/') + '/'
+
+          parsed_website_url = urlparse(WEBSITE_URL)
+          base_path = parsed_website_url.path.rstrip('/')
+          PAGE_NOT_FOUND_PATH = f'{base_path}/page-not-found/'
           PAGE_NOT_FOUND_URLS = (
               f'{WEBSITE_URL}page-not-found',
               f'{WEBSITE_URL}page-not-found/',
@@ -169,6 +177,7 @@ jobs:
           with open('broken_link_count.txt', 'w', encoding='utf-8') as count_file:
               count_file.write(str(len(broken_tables)))
           PYEOF
+          SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
           python filter_script.py
   
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
