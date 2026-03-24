@@ -41,41 +41,105 @@ jobs:
       - name: Run Link Checker
         run: |
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
-          linkchecker -F html $SITE_URL --threads=100
+          linkchecker \
+            --check-extern \
+            --threads=100 \
+            --ignore-url='^https?://localhost(:[0-9]+)?(/|$)' \
+            -F csv \
+            -F html \
+            "$SITE_URL"
         continue-on-error: true
 
-      - name: Filter HTML for specific string and preserve page structure
+      - name: Filter broken links and build report
         id: filter_html
         run: |
-          echo "import sys" > filter_script.py
-          echo "from bs4 import BeautifulSoup" >> filter_script.py
-          echo "website_url = 'https://is.docs.wso2.com/en/latest/'" >> filter_script.py
-          echo "with open('linkchecker-out.html', 'r') as file:" >> filter_script.py
-          echo "    soup = BeautifulSoup(file, 'html.parser')" >> filter_script.py
-          echo "string_to_filter = 'https://is.docs.wso2.com/en/latest/page-not-found'" >> filter_script.py
-          echo "final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')" >> filter_script.py
-          echo "final_soup.head.append(soup.head)" >> filter_script.py
-          echo "# Add custom header, broken link count and spacing" >> filter_script.py
-          echo "header_tag = final_soup.new_tag('h1')" >> filter_script.py
-          echo "header_tag.string = 'Broken Link Checker - ' + website_url" >> filter_script.py
-          echo "final_soup.body.append(header_tag)" >> filter_script.py
-          echo "# Count and append the number of broken links found" >> filter_script.py
-          echo "tables = soup.find_all('table')" >> filter_script.py
-          echo "broken_link_count = sum(string_to_filter in str(table) for table in tables)" >> filter_script.py
-          echo "with open('broken_link_count.txt', 'w') as count_file:" >> filter_script.py
-          echo "    count_file.write(str(broken_link_count))" >> filter_script.py
-          echo "count_tag = final_soup.new_tag('p')" >> filter_script.py
-          echo "count_tag.string = 'Number of broken links found: ' + str(broken_link_count)" >> filter_script.py
-          echo "final_soup.body.append(count_tag)" >> filter_script.py
-          echo "final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "# Append filtered tables" >> filter_script.py
-          echo "for table in tables:" >> filter_script.py
-          echo "    if string_to_filter in str(table):" >> filter_script.py
-          echo "        final_soup.body.append(table)" >> filter_script.py
-          echo "        final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "final_soup.body.append(final_soup.new_tag('br'))" >> filter_script.py
-          echo "with open('broken_links_report_IS.html', 'w') as file:" >> filter_script.py
-          echo "    file.write(str(final_soup))" >> filter_script.py
+          cat > filter_script.py << 'PYEOF'
+          from bs4 import BeautifulSoup
+
+          WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
+          PAGE_NOT_FOUND = f'{WEBSITE_URL}page-not-found'
+          LOCALHOST_PREFIXES = (
+              'http://localhost',
+              'https://localhost',
+          )
+          IGNORE_ERROR_TOKENS = (
+              '403',
+              'forbidden',
+          )
+
+          with open('linkchecker-out.csv', 'r', encoding='utf-8') as csv_file:
+              rows = csv_file.readlines()
+
+          broken_urls = set()
+
+          for row in rows:
+              if row.startswith('#') or not row.strip():
+                  continue
+
+              parts = [item.strip() for item in row.split(';')]
+              if len(parts) < 8:
+                  continue
+
+              # linkchecker fields:
+              # 0 urlname, 3 result, 6 valid, 7 final url
+              urlname = parts[0]
+              result = parts[3]
+              valid = parts[6]
+              final_url = parts[7]
+
+              if urlname.startswith(LOCALHOST_PREFIXES) or final_url.startswith(LOCALHOST_PREFIXES):
+                  continue
+
+              is_soft_404 = PAGE_NOT_FOUND in urlname or PAGE_NOT_FOUND in final_url
+
+              # Ignore 403/Forbidden while still reporting other failures.
+              result_lower = result.lower()
+              is_403 = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
+              is_hard_failure = (valid == 'False') and not is_403
+
+              if is_soft_404 or is_hard_failure:
+                  broken_urls.add(urlname)
+                  broken_urls.add(final_url)
+
+          with open('linkchecker-out.html', 'r', encoding='utf-8') as html_file:
+              soup = BeautifulSoup(html_file, 'html.parser')
+
+          tables = soup.find_all('table')
+          broken_tables = []
+          for table in tables:
+              table_str = str(table)
+              has_known_broken_url = any(url and url in table_str for url in broken_urls)
+              # Keep explicit soft-404 table matching so redirected links that
+              # end on /page-not-found/ are always included even if linkchecker
+              # reports them as Valid: 200 OK.
+              has_soft_404_marker = PAGE_NOT_FOUND in table_str
+              if has_known_broken_url or has_soft_404_marker:
+                  broken_tables.append(table)
+
+          final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')
+          final_soup.head.append(soup.head)
+
+          header_tag = final_soup.new_tag('h1')
+          header_tag.string = f'Broken Link Checker - {WEBSITE_URL}'
+          final_soup.body.append(header_tag)
+
+          count_tag = final_soup.new_tag('p')
+          count_tag.string = f'Number of broken links found: {len(broken_tables)}'
+          final_soup.body.append(count_tag)
+          final_soup.body.append(final_soup.new_tag('br'))
+
+          for table in broken_tables:
+              final_soup.body.append(table)
+              final_soup.body.append(final_soup.new_tag('br'))
+
+          final_soup.body.append(final_soup.new_tag('br'))
+
+          with open('broken_links_report_IS.html', 'w', encoding='utf-8') as output_file:
+              output_file.write(str(final_soup))
+
+          with open('broken_link_count.txt', 'w', encoding='utf-8') as count_file:
+              count_file.write(str(len(broken_tables)))
+          PYEOF
           python filter_script.py
   
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
