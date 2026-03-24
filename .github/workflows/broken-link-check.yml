@@ -35,144 +35,91 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install linkchecker beautifulsoup4 requests
+          pip install linkchecker beautifulsoup4
 
       - name: Run Link Checker
         run: |
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
-          linkchecker -F html $SITE_URL --threads=100
+          # --check-extern: also check external links (e.g. http://wso2.com/...),
+          # not just internal ones. Without this flag, linkchecker silently skips
+          # every link pointing outside is.docs.wso2.com, which is why broken
+          # external links like http://wso2.com/products/identity-server/ were
+          # never caught.
+          linkchecker --check-extern -F html $SITE_URL --threads=100
         continue-on-error: true
 
-      - name: Write filter and soft-404 detection script
+      - name: Filter HTML for specific string and preserve page structure
+        id: filter_html
         run: |
           cat > filter_script.py << 'PYEOF'
           from bs4 import BeautifulSoup
-          import requests
-          import re
 
-          SITE_BASE = 'https://is.docs.wso2.com/en/latest/'
-          PAGE_NOT_FOUND_URL = 'https://is.docs.wso2.com/en/latest/page-not-found'
-          REPORT_INPUT = 'linkchecker-out.html'
-          REPORT_OUTPUT = 'broken_links_report_IS.html'
+          website_url = 'https://is.docs.wso2.com/en/latest/'
 
-          # ---------------------------------------------------------------
-          # Soft-404 check: request the URL and see if the server silently
-          # redirects to /page-not-found/. This catches pages that don't
-          # exist yet but return HTTP 200 instead of a real 404 — which
-          # means linkchecker considers them valid and never flags them.
-          #
-          # This is exactly why links like "MCP Server Quick Start -
-          # TypeScript/Python" listed under the #whats-next section go
-          # undetected: they are real hrefs pointing to pages that haven't
-          # been created, the server redirects to /page-not-found/ with a
-          # 200, so linkchecker sees 200 and moves on.
-          # ---------------------------------------------------------------
-          def is_soft_404(url):
-              """Return True if the URL ultimately resolves to the
-              page-not-found page, regardless of the HTTP status code."""
-              # Strip fragment — fragments are client-side only, the server
-              # never sees them, so we just need to verify the page exists.
-              bare_url = url.split('#')[0]
-              try:
-                  resp = requests.get(bare_url, allow_redirects=True, timeout=15)
-                  return PAGE_NOT_FOUND_URL in resp.url
-              except Exception:
-                  return False
+          with open('linkchecker-out.html', 'r') as file:
+              soup = BeautifulSoup(file, 'html.parser')
 
-          # ---------------------------------------------------------------
-          # Parse the linkchecker HTML report
-          # ---------------------------------------------------------------
-          with open(REPORT_INPUT, 'r', encoding='utf-8') as f:
-              soup = BeautifulSoup(f, 'html.parser')
+          # Match tables that linkchecker has flagged as broken.
+          # This now covers two cases:
+          #   1. Internal links that resolve to the WSO2 /page-not-found/ soft-404
+          #   2. External links that returned a real HTTP error (4xx/5xx),
+          #      e.g. http://wso2.com/products/identity-server/ returning 404.
+          #      linkchecker reports these with the text "404 Not Found" or
+          #      similar error strings directly in the table, so they are caught
+          #      automatically once --check-extern is enabled.
+          string_to_filter = 'https://is.docs.wso2.com/en/latest/page-not-found'
 
-          tables = soup.find_all('table')
-
-          # ---------------------------------------------------------------
-          # Two-pass broken link detection:
-          #
-          # Pass 1 (original): linkchecker already logged /page-not-found
-          #   in the report — keep that behaviour unchanged.
-          #
-          # Pass 2 (new): for every internal link found in each table that
-          #   linkchecker did NOT flag, do a live soft-404 check. This is
-          #   what catches the "MCP Server Quick Start" links and any other
-          #   pages that the site serves as a 200 /page-not-found/.
-          # ---------------------------------------------------------------
-          broken_tables = []
-          checked_urls = {}  # cache to avoid re-requesting the same URL
-
-          for table in tables:
-              table_str = str(table)
-
-              # Pass 1 — already flagged by linkchecker
-              if PAGE_NOT_FOUND_URL in table_str:
-                  broken_tables.append({
-                      'table': table,
-                      'reason': 'linkchecker detected redirect to /page-not-found/',
-                      'url': None
-                  })
-                  continue
-
-              # Pass 2 — extract all internal hrefs from the table and
-              # check each one live for a soft-404.
-              internal_links = re.findall(
-                  r'https://is\.docs\.wso2\.com/en/latest/[^\s"\'<>]+',
-                  table_str
-              )
-
-              found_soft_404 = None
-              for link in internal_links:
-                  bare = link.split('#')[0].rstrip('/')
-                  if bare not in checked_urls:
-                      checked_urls[bare] = is_soft_404(link)
-                  if checked_urls[bare]:
-                      found_soft_404 = link
-                      break
-
-              if found_soft_404:
-                  broken_tables.append({
-                      'table': table,
-                      'reason': f'page does not exist (soft 404): {found_soft_404}',
-                      'url': found_soft_404
-                  })
-
-          # ---------------------------------------------------------------
-          # Build the output HTML report
-          # ---------------------------------------------------------------
           final_soup = BeautifulSoup(
               '<!DOCTYPE html><html><head></head><body></body></html>',
               'html.parser'
           )
           final_soup.head.append(soup.head)
 
-          h1 = final_soup.new_tag('h1')
-          h1.string = f'Broken Link Checker - {SITE_BASE}'
-          final_soup.body.append(h1)
+          header_tag = final_soup.new_tag('h1')
+          header_tag.string = 'Broken Link Checker - ' + website_url
+          final_soup.body.append(header_tag)
 
-          count_p = final_soup.new_tag('p')
-          count_p.string = f'Number of broken links found: {len(broken_tables)}'
-          final_soup.body.append(count_p)
+          tables = soup.find_all('table')
+
+          # Collect broken tables:
+          #   - internal soft-404s (redirect to /page-not-found/)
+          #   - external hard errors reported by linkchecker (now visible
+          #     because --check-extern is enabled)
+          broken_tables = []
+          for table in tables:
+              table_str = str(table)
+              is_internal_soft_404 = string_to_filter in table_str
+              # linkchecker flags external broken links with error text in the
+              # Result column. A "Not Found" or 4xx/5xx in the table means the
+              # link genuinely failed — not just redirected to a soft 404.
+              is_external_error = (
+                  'Not Found' in table_str or
+                  'Error' in table_str or
+                  'Forbidden' in table_str
+              ) and string_to_filter not in table_str  # avoid double-counting
+              if is_internal_soft_404 or is_external_error:
+                  broken_tables.append(table)
+
+          broken_link_count = len(broken_tables)
+
+          with open('broken_link_count.txt', 'w') as count_file:
+              count_file.write(str(broken_link_count))
+
+          count_tag = final_soup.new_tag('p')
+          count_tag.string = 'Number of broken links found: ' + str(broken_link_count)
+          final_soup.body.append(count_tag)
           final_soup.body.append(final_soup.new_tag('br'))
 
-          for entry in broken_tables:
-              reason_p = final_soup.new_tag('p')
-              reason_p.string = f'Detected via: {entry["reason"]}'
-              final_soup.body.append(reason_p)
-              final_soup.body.append(entry['table'])
+          for table in broken_tables:
+              final_soup.body.append(table)
               final_soup.body.append(final_soup.new_tag('br'))
 
-          with open(REPORT_OUTPUT, 'w', encoding='utf-8') as f:
-              f.write(str(final_soup))
+          final_soup.body.append(final_soup.new_tag('br'))
 
-          with open('broken_link_count.txt', 'w') as f:
-              f.write(str(len(broken_tables)))
-
-          print(f'Done. Broken links found: {len(broken_tables)}')
+          with open('broken_links_report_IS.html', 'w') as file:
+              file.write(str(final_soup))
           PYEOF
 
-      - name: Filter HTML report
-        id: filter_html
-        run: |
           python filter_script.py
 
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
