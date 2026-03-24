@@ -58,7 +58,11 @@ jobs:
           from bs4 import BeautifulSoup
 
           WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
-          PAGE_NOT_FOUND = f'{WEBSITE_URL}page-not-found'
+          PAGE_NOT_FOUND_PATH = '/en/latest/page-not-found/'
+          PAGE_NOT_FOUND_URLS = (
+              f'{WEBSITE_URL}page-not-found',
+              f'{WEBSITE_URL}page-not-found/',
+          )
           LOCALHOST_PREFIXES = (
               'http://localhost',
               'https://localhost',
@@ -98,11 +102,11 @@ jobs:
                   # - entries found from /page-not-found/ parent pages
                   result_lower = result.lower()
                   should_ignore_result = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
-                  parent_is_page_not_found = PAGE_NOT_FOUND in parentname
+                  parent_is_page_not_found = any(url in parentname for url in PAGE_NOT_FOUND_URLS)
                   if should_ignore_result or parent_is_page_not_found:
                       continue
 
-                  is_soft_404 = PAGE_NOT_FOUND in final_url
+                  is_soft_404 = PAGE_NOT_FOUND_PATH in final_url
                   is_hard_failure = (valid == 'False')
 
                   if is_soft_404 or is_hard_failure:
@@ -129,9 +133,16 @@ jobs:
               # Keep explicit soft-404 table matching so redirected links that
               # end on /page-not-found/ are always included even if linkchecker
               # reports them as Valid: 200 OK.
-              has_soft_404_marker = PAGE_NOT_FOUND in table_str
-              parent_is_page_not_found = f'Parent URL\t{PAGE_NOT_FOUND}' in table_str
-              if (has_known_broken_url or has_soft_404_marker) and not parent_is_page_not_found:
+              has_soft_404_marker = PAGE_NOT_FOUND_PATH in table_str
+              parent_is_page_not_found = any(
+                  parent_url in table_link_values for parent_url in PAGE_NOT_FOUND_URLS
+              )
+              page_is_page_not_found = any(
+                  page_url in table_link_values for page_url in PAGE_NOT_FOUND_URLS
+              )
+              if (has_known_broken_url or has_soft_404_marker) and not (
+                  parent_is_page_not_found or page_is_page_not_found
+              ):
                   broken_tables.append(table)
 
           final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')
