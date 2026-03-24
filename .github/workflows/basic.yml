@@ -54,6 +54,7 @@ jobs:
         id: filter_html
         run: |
           cat > filter_script.py << 'PYEOF'
+          import csv
           from bs4 import BeautifulSoup
 
           WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
@@ -65,41 +66,48 @@ jobs:
           IGNORE_ERROR_TOKENS = (
               '403',
               'forbidden',
+              '429 too many requests',
+              'connectionerror',
           )
 
-          with open('linkchecker-out.csv', 'r', encoding='utf-8') as csv_file:
-              rows = csv_file.readlines()
-
           broken_urls = set()
+          with open('linkchecker-out.csv', 'r', encoding='utf-8', newline='') as csv_file:
+              reader = csv.reader(csv_file, delimiter=';')
+              for parts in reader:
+                  if not parts:
+                      continue
+                  if parts[0].startswith('#'):
+                      continue
+                  if len(parts) < 8:
+                      continue
 
-          for row in rows:
-              if row.startswith('#') or not row.strip():
-                  continue
+                  # linkchecker fields:
+                  # 0 urlname, 1 parentname, 3 result, 6 valid, 7 final url
+                  urlname = parts[0].strip()
+                  parentname = parts[1].strip()
+                  result = parts[3].strip()
+                  valid = parts[6].strip()
+                  final_url = parts[7].strip()
 
-              parts = [item.strip() for item in row.split(';')]
-              if len(parts) < 8:
-                  continue
+                  if urlname.startswith(LOCALHOST_PREFIXES) or final_url.startswith(LOCALHOST_PREFIXES):
+                      continue
 
-              # linkchecker fields:
-              # 0 urlname, 3 result, 6 valid, 7 final url
-              urlname = parts[0]
-              result = parts[3]
-              valid = parts[6]
-              final_url = parts[7]
+                  # Skip false positives discovered in docs runs:
+                  # - 429 rate limit responses
+                  # - transient sample hostname resolution failures
+                  # - entries found from /page-not-found/ parent pages
+                  result_lower = result.lower()
+                  should_ignore_result = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
+                  parent_is_page_not_found = PAGE_NOT_FOUND in parentname
+                  if should_ignore_result or parent_is_page_not_found:
+                      continue
 
-              if urlname.startswith(LOCALHOST_PREFIXES) or final_url.startswith(LOCALHOST_PREFIXES):
-                  continue
+                  is_soft_404 = PAGE_NOT_FOUND in final_url
+                  is_hard_failure = (valid == 'False')
 
-              is_soft_404 = PAGE_NOT_FOUND in urlname or PAGE_NOT_FOUND in final_url
-
-              # Ignore 403/Forbidden while still reporting other failures.
-              result_lower = result.lower()
-              is_403 = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
-              is_hard_failure = (valid == 'False') and not is_403
-
-              if is_soft_404 or is_hard_failure:
-                  broken_urls.add(urlname)
-                  broken_urls.add(final_url)
+                  if is_soft_404 or is_hard_failure:
+                      broken_urls.add(urlname)
+                      broken_urls.add(final_url)
 
           with open('linkchecker-out.html', 'r', encoding='utf-8') as html_file:
               soup = BeautifulSoup(html_file, 'html.parser')
@@ -108,12 +116,22 @@ jobs:
           broken_tables = []
           for table in tables:
               table_str = str(table)
-              has_known_broken_url = any(url and url in table_str for url in broken_urls)
+              table_link_values = set()
+              for anchor in table.find_all('a'):
+                  href = (anchor.get('href') or '').strip()
+                  text = anchor.get_text(strip=True)
+                  if href:
+                      table_link_values.add(href)
+                  if text:
+                      table_link_values.add(text)
+
+              has_known_broken_url = any(url and url in table_link_values for url in broken_urls)
               # Keep explicit soft-404 table matching so redirected links that
               # end on /page-not-found/ are always included even if linkchecker
               # reports them as Valid: 200 OK.
               has_soft_404_marker = PAGE_NOT_FOUND in table_str
-              if has_known_broken_url or has_soft_404_marker:
+              parent_is_page_not_found = f'Parent URL\t{PAGE_NOT_FOUND}' in table_str
+              if (has_known_broken_url or has_soft_404_marker) and not parent_is_page_not_found:
                   broken_tables.append(table)
 
           final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')
