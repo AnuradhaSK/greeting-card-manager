@@ -146,11 +146,19 @@ jobs:
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
           echo "broken_links_count=$BROKEN_LINKS_COUNT" >> $GITHUB_ENV
 
-      - name: Upload HTML as Artifact
+      - name: Upload HTML report as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: broken_links_report_IS
           path: broken_links_report_IS.html
+
+      - name: Upload raw linkchecker output as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkchecker_raw_output
+          path: |
+            linkchecker-out.html
+            linkchecker-out.csv
 
       - name: Notify Google Chat
         env:
