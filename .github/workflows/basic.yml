@@ -43,7 +43,7 @@ jobs:
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
           linkchecker \
             --check-extern \
-            --threads=100 \
+            --threads=500 \
             --ignore-url='^https?://localhost(:[0-9]+)?(/|$)' \
             -F csv \
             -F html \
@@ -73,7 +73,7 @@ jobs:
           # so versioned parent URLs like /en/7.2.0/page-not-found/ slipped
           # through and caused false positives for their CSS/SVG/edit links.
           PAGE_NOT_FOUND_PARENT_RE = re.compile(
-              r'https://is\.docs\.wso2\.com/en/[^/]+/page-not-found'
+              r'https://is\.docs\.wso2\.com/en/[^/]+/page-not-found/'
           )
 
           LOCALHOST_PREFIXES = (
