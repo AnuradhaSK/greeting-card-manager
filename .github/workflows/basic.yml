@@ -56,6 +56,7 @@ jobs:
           cat > filter_script.py << 'PYEOF'
           import csv
           import os
+          import re
           from bs4 import BeautifulSoup
 
           WEBSITE_URL = os.environ.get('SITE_URL', 'https://is.docs.wso2.com/en/latest/').strip()
@@ -63,6 +64,18 @@ jobs:
               WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
           WEBSITE_URL = WEBSITE_URL.rstrip('/') + '/'
           PAGE_NOT_FOUND = f'{WEBSITE_URL}page-not-found'
+
+          # Matches /page-not-found under ANY version path, e.g.:
+          #   https://is.docs.wso2.com/en/latest/page-not-found/
+          #   https://is.docs.wso2.com/en/7.2.0/page-not-found/
+          #   https://is.docs.wso2.com/en/next/page-not-found/
+          # The existing check only tested PAGE_NOT_FOUND (always /latest/),
+          # so versioned parent URLs like /en/7.2.0/page-not-found/ slipped
+          # through and caused false positives for their CSS/SVG/edit links.
+          PAGE_NOT_FOUND_PARENT_RE = re.compile(
+              r'https://is\.docs\.wso2\.com/en/[^/]+/page-not-found'
+          )
+
           LOCALHOST_PREFIXES = (
               'http://localhost',
               'https://localhost',
@@ -102,7 +115,7 @@ jobs:
                   # - entries found from /page-not-found/ parent pages
                   result_lower = result.lower()
                   should_ignore_result = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
-                  parent_is_page_not_found = PAGE_NOT_FOUND in parentname
+                  parent_is_page_not_found = bool(PAGE_NOT_FOUND_PARENT_RE.search(parentname))
                   if should_ignore_result or parent_is_page_not_found:
                       continue
 
@@ -134,7 +147,7 @@ jobs:
               # end on /page-not-found/ are always included even if linkchecker
               # reports them as Valid: 200 OK.
               has_soft_404_marker = PAGE_NOT_FOUND in table_str
-              parent_is_page_not_found = f'Parent URL\t{PAGE_NOT_FOUND}' in table_str
+              parent_is_page_not_found = bool(PAGE_NOT_FOUND_PARENT_RE.search(table_str))
               if (has_known_broken_url or has_soft_404_marker) and not parent_is_page_not_found:
                   broken_tables.append(table)
 
