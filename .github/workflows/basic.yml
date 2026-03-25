@@ -43,7 +43,7 @@ jobs:
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
           linkchecker \
             --check-extern \
-            --threads=500 \
+            --threads=100 \
             --ignore-url='^https?://localhost(:[0-9]+)?(/|$)' \
             -F csv \
             -F html \
@@ -53,27 +53,12 @@ jobs:
       - name: Filter broken links and build report
         id: filter_html
         run: |
+          
           cat > filter_script.py << 'PYEOF'
-          import csv
-          import os
-          import re
           from bs4 import BeautifulSoup
 
-          WEBSITE_URL = os.environ.get('SITE_URL', 'https://is.docs.wso2.com/en/latest/').strip()
-          if not WEBSITE_URL:
-              WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
-          WEBSITE_URL = WEBSITE_URL.rstrip('/') + '/'
-          # Matches /page-not-found under ANY version path, e.g.:
-          #   https://is.docs.wso2.com/en/latest/page-not-found/
-          #   https://is.docs.wso2.com/en/7.2.0/page-not-found/
-          #   https://is.docs.wso2.com/en/next/page-not-found/
-          PAGE_NOT_FOUND_PARENT_RE = re.compile(
-              r'https?://is\.docs\.wso2\.com/en/[^/]+/page-not-found/?'
-          )
-          SOFT_404_URL_RE = re.compile(
-              r'^https?://is\.docs\.wso2\.com/en/[^/]+/page-not-found/?(?:[#?].*)?$'
-          )
-
+          WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
+          PAGE_NOT_FOUND = f'{WEBSITE_URL}page-not-found'
           LOCALHOST_PREFIXES = (
               'http://localhost',
               'https://localhost',
@@ -81,61 +66,41 @@ jobs:
           IGNORE_ERROR_TOKENS = (
               '403',
               'forbidden',
-              '429 too many requests',
-              'connectionerror',
           )
 
+          with open('linkchecker-out.csv', 'r', encoding='utf-8') as csv_file:
+              rows = csv_file.readlines()
+
           broken_urls = set()
-          with open('linkchecker-out.csv', 'r', encoding='utf-8', newline='') as csv_file:
-              reader = csv.reader(csv_file, delimiter=';')
-              for parts in reader:
-                  if not parts:
-                      continue
-                  if parts[0].startswith('#'):
-                      continue
-                  if len(parts) < 8:
-                      continue
 
-                  # linkchecker fields:
-                  # 0 urlname, 1 parentname, 3 result, 6 valid, 7 final url
-                  urlname = parts[0].strip()
-                  parentname = parts[1].strip()
-                  result = parts[3].strip()
-                  valid = parts[6].strip()
-                  final_url = parts[7].strip()
+          for row in rows:
+              if row.startswith('#') or not row.strip():
+                  continue
 
-                  if urlname.startswith(LOCALHOST_PREFIXES) or final_url.startswith(LOCALHOST_PREFIXES):
-                      continue
+              parts = [item.strip() for item in row.split(';')]
+              if len(parts) < 8:
+                  continue
 
-                  # Skip false positives discovered in docs runs:
-                  # - 429 rate limit responses
-                  # - transient sample hostname resolution failures
-                  # - entries found from /page-not-found/ parent pages
-                  result_lower = result.lower()
-                  should_ignore_result = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
-                  parent_is_page_not_found = bool(PAGE_NOT_FOUND_PARENT_RE.search(parentname))
-                  if should_ignore_result or parent_is_page_not_found:
-                      continue
+              # linkchecker fields:
+              # 0 urlname, 3 result, 6 valid, 7 final url
+              urlname = parts[0]
+              result = parts[3]
+              valid = parts[6]
+              final_url = parts[7]
 
-                  # Soft-404 detection:
-                  # Linkchecker may still report "Valid: 200 OK" when the URL
-                  # finally resolves to a docs page-not-found endpoint.
-                  # Match both http/https and all version roots (/latest/,
-                  # /7.2.0/, /next/, etc.) so redirected not-found pages are
-                  # consistently flagged.
-                  is_soft_404 = bool(
-                      SOFT_404_URL_RE.match(final_url)
-                      or SOFT_404_URL_RE.match(urlname)
-                      or any(
-                          SOFT_404_URL_RE.match(candidate)
-                          for candidate in re.findall(r"https?://[^\\s'\"`]+", result)
-                      )
-                  )
-                  is_hard_failure = (valid == 'False')
+              if urlname.startswith(LOCALHOST_PREFIXES) or final_url.startswith(LOCALHOST_PREFIXES):
+                  continue
 
-                  if is_soft_404 or is_hard_failure:
-                      broken_urls.add(urlname)
-                      broken_urls.add(final_url)
+              is_soft_404 = PAGE_NOT_FOUND in urlname or PAGE_NOT_FOUND in final_url
+
+              # Ignore 403/Forbidden while still reporting other failures.
+              result_lower = result.lower()
+              is_403 = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
+              is_hard_failure = (valid == 'False') and not is_403
+
+              if is_soft_404 or is_hard_failure:
+                  broken_urls.add(urlname)
+                  broken_urls.add(final_url)
 
           with open('linkchecker-out.html', 'r', encoding='utf-8') as html_file:
               soup = BeautifulSoup(html_file, 'html.parser')
@@ -144,22 +109,12 @@ jobs:
           broken_tables = []
           for table in tables:
               table_str = str(table)
-              table_link_values = set()
-              for anchor in table.find_all('a'):
-                  href = (anchor.get('href') or '').strip()
-                  text = anchor.get_text(strip=True)
-                  if href:
-                      table_link_values.add(href)
-                  if text:
-                      table_link_values.add(text)
-
-              has_known_broken_url = any(url and url in table_link_values for url in broken_urls)
+              has_known_broken_url = any(url and url in table_str for url in broken_urls)
               # Keep explicit soft-404 table matching so redirected links that
               # end on /page-not-found/ are always included even if linkchecker
               # reports them as Valid: 200 OK.
-              has_soft_404_marker = bool(SOFT_404_URL_RE.search(table_str))
-              parent_is_page_not_found = bool(PAGE_NOT_FOUND_PARENT_RE.search(table_str))
-              if (has_known_broken_url or has_soft_404_marker) and not parent_is_page_not_found:
+              has_soft_404_marker = PAGE_NOT_FOUND in table_str
+              if has_known_broken_url or has_soft_404_marker:
                   broken_tables.append(table)
 
           final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')
@@ -190,7 +145,6 @@ jobs:
   
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
           echo "broken_links_count=$BROKEN_LINKS_COUNT" >> $GITHUB_ENV
-
 
       - name: Upload HTML as Artifact
         uses: actions/upload-artifact@v4
