@@ -58,9 +58,6 @@ jobs:
           from bs4 import BeautifulSoup
 
           WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
-          # Strip trailing slash for robust substring matching (handles both
-          # '.../page-not-found' and '.../page-not-found/' in any field).
-          PAGE_NOT_FOUND_BASE = f'{WEBSITE_URL}page-not-found'.rstrip('/')
           PAGE_NOT_FOUND = f'{WEBSITE_URL}page-not-found'
           LOCALHOST_PREFIXES = (
               'http://localhost',
@@ -70,10 +67,6 @@ jobs:
               '403',
               'forbidden',
           )
-
-          def contains_page_not_found(s):
-              """Match page-not-found regardless of trailing slash."""
-              return PAGE_NOT_FOUND_BASE in s
 
           with open('linkchecker-out.csv', 'r', encoding='utf-8') as csv_file:
               rows = csv_file.readlines()
@@ -88,26 +81,17 @@ jobs:
               if len(parts) < 8:
                   continue
 
-              # linkchecker CSV fields:
-              # 0 urlname, 1 parentname, 2 base, 3 result, 4 info (redirect
-              # chain / warnings), 5 warning, 6 valid, 7 final url
-              urlname   = parts[0]
-              result    = parts[3]
-              info      = parts[4]   # contains redirect-chain text
-              valid     = parts[6]
+              # linkchecker fields:
+              # 0 urlname, 3 result, 6 valid, 7 final url
+              urlname = parts[0]
+              result = parts[3]
+              valid = parts[6]
               final_url = parts[7]
 
               if urlname.startswith(LOCALHOST_PREFIXES) or final_url.startswith(LOCALHOST_PREFIXES):
                   continue
 
-              # Soft-404: page-not-found appears in ANY of urlname, final_url,
-              # or the info/redirect-chain field (catches "Valid: 200 OK" links
-              # that were silently redirected through /page-not-found/).
-              is_soft_404 = (
-                  contains_page_not_found(urlname)
-                  or contains_page_not_found(final_url)
-                  or contains_page_not_found(info)
-              )
+              is_soft_404 = PAGE_NOT_FOUND in urlname or PAGE_NOT_FOUND in final_url
 
               # Ignore 403/Forbidden while still reporting other failures.
               result_lower = result.lower()
@@ -126,10 +110,10 @@ jobs:
           for table in tables:
               table_str = str(table)
               has_known_broken_url = any(url and url in table_str for url in broken_urls)
-              # Soft-404 marker check uses the base string (no trailing slash)
-              # so it matches whether the HTML stores the URL with or without
-              # a trailing slash.
-              has_soft_404_marker = PAGE_NOT_FOUND_BASE in table_str
+              # Keep explicit soft-404 table matching so redirected links that
+              # end on /page-not-found/ are always included even if linkchecker
+              # reports them as Valid: 200 OK.
+              has_soft_404_marker = PAGE_NOT_FOUND in table_str
               if has_known_broken_url or has_soft_404_marker:
                   broken_tables.append(table)
 
