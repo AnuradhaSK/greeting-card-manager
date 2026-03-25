@@ -56,21 +56,13 @@ jobs:
           cat > filter_script.py << 'PYEOF'
           import csv
           import os
-          from urllib.parse import urlparse
           from bs4 import BeautifulSoup
 
           WEBSITE_URL = os.environ.get('SITE_URL', 'https://is.docs.wso2.com/en/latest/').strip()
           if not WEBSITE_URL:
               WEBSITE_URL = 'https://is.docs.wso2.com/en/latest/'
           WEBSITE_URL = WEBSITE_URL.rstrip('/') + '/'
-
-          parsed_website_url = urlparse(WEBSITE_URL)
-          base_path = parsed_website_url.path.rstrip('/')
-          PAGE_NOT_FOUND_PATH = f'{base_path}/page-not-found/'
-          PAGE_NOT_FOUND_URLS = (
-              f'{WEBSITE_URL}page-not-found',
-              f'{WEBSITE_URL}page-not-found/',
-          )
+          PAGE_NOT_FOUND = f'{WEBSITE_URL}page-not-found'
           LOCALHOST_PREFIXES = (
               'http://localhost',
               'https://localhost',
@@ -110,11 +102,11 @@ jobs:
                   # - entries found from /page-not-found/ parent pages
                   result_lower = result.lower()
                   should_ignore_result = any(token in result_lower for token in IGNORE_ERROR_TOKENS)
-                  parent_is_page_not_found = any(url in parentname for url in PAGE_NOT_FOUND_URLS)
+                  parent_is_page_not_found = PAGE_NOT_FOUND in parentname
                   if should_ignore_result or parent_is_page_not_found:
                       continue
 
-                  is_soft_404 = PAGE_NOT_FOUND_PATH in final_url
+                  is_soft_404 = PAGE_NOT_FOUND in final_url
                   is_hard_failure = (valid == 'False')
 
                   if is_soft_404 or is_hard_failure:
@@ -141,16 +133,9 @@ jobs:
               # Keep explicit soft-404 table matching so redirected links that
               # end on /page-not-found/ are always included even if linkchecker
               # reports them as Valid: 200 OK.
-              has_soft_404_marker = PAGE_NOT_FOUND_PATH in table_str
-              parent_is_page_not_found = any(
-                  parent_url in table_link_values for parent_url in PAGE_NOT_FOUND_URLS
-              )
-              page_is_page_not_found = any(
-                  page_url in table_link_values for page_url in PAGE_NOT_FOUND_URLS
-              )
-              if (has_known_broken_url or has_soft_404_marker) and not (
-                  parent_is_page_not_found or page_is_page_not_found
-              ):
+              has_soft_404_marker = PAGE_NOT_FOUND in table_str
+              parent_is_page_not_found = f'Parent URL\t{PAGE_NOT_FOUND}' in table_str
+              if (has_known_broken_url or has_soft_404_marker) and not parent_is_page_not_found:
                   broken_tables.append(table)
 
           final_soup = BeautifulSoup('<!DOCTYPE html><html><head></head><body></body></html>', 'html.parser')
@@ -177,11 +162,11 @@ jobs:
           with open('broken_link_count.txt', 'w', encoding='utf-8') as count_file:
               count_file.write(str(len(broken_tables)))
           PYEOF
-          SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
           python filter_script.py
   
           BROKEN_LINKS_COUNT=$(cat broken_link_count.txt)
           echo "broken_links_count=$BROKEN_LINKS_COUNT" >> $GITHUB_ENV
+
 
       - name: Upload HTML as Artifact
         uses: actions/upload-artifact@v4
