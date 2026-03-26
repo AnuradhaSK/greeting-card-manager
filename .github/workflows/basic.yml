@@ -43,7 +43,7 @@ jobs:
           SITE_URL=${{ github.event.inputs.siteUrl || env.DEFAULT_URL }}
           linkchecker \
             --check-extern \
-            --threads=100 \
+            --threads=10 \
             --ignore-url='^https?://localhost(:[0-9]+)?(/|$)' \
             -F csv \
             -F html \
